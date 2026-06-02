@@ -338,6 +338,14 @@ final class Cloudflare_R2_Uploads
             return;
         }
 
+        /**
+         * Filters the max file size (bytes) allowed for non-cURL HTTP fallback uploads.
+         *
+         * When cURL is unavailable, uploads are sent with wp_remote_request and require
+         * loading the file into memory. Default: 25 MB.
+         *
+         * @param int $max_fallback_size Max fallback upload size in bytes.
+         */
         $max_fallback_size = (int) apply_filters('cloudflare_r2_uploads_http_fallback_max_bytes', 25 * MB_IN_BYTES);
         $file_size = filesize($absolute_path);
         if (! is_int($file_size) || $file_size < 0 || $file_size > $max_fallback_size) {
