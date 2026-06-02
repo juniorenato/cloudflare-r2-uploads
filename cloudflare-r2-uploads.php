@@ -242,7 +242,6 @@ final class Cloudflare_R2_Uploads
         return wp_parse_args($saved, $defaults);
     }
 
-
     private function build_public_baseurl(string $public_base_url, string $prefix): string
     {
         $public_base_url = untrailingslashit($public_base_url);
@@ -326,21 +325,111 @@ final class Cloudflare_R2_Uploads
             $mime_type = 'application/octet-stream';
         }
 
-        wp_remote_request(
-            'https://' . $host . $canonical_uri,
+        $endpoint = 'https://' . $host . $canonical_uri;
+        $headers = [
+            'Authorization' => $authorization,
+            'Content-Type' => $mime_type,
+            'Host' => $host,
+            'x-amz-content-sha256' => $payload_hash,
+            'x-amz-date' => $timestamp,
+        ];
+
+        if ($this->put_object_with_curl($endpoint, $headers, $absolute_path)) {
+            return;
+        }
+
+        $max_fallback_size = (int) apply_filters('cloudflare_r2_uploads_http_fallback_max_bytes', 25 * MB_IN_BYTES);
+        $file_size = filesize($absolute_path);
+        if (! is_int($file_size) || $file_size < 0 || $file_size > $max_fallback_size) {
+            error_log('Cloudflare R2 Uploads: fallback upload skipped due to file size for ' . $absolute_path);
+            return;
+        }
+
+        $body = file_get_contents($absolute_path);
+        if (! is_string($body)) {
+            error_log('Cloudflare R2 Uploads: could not read file for upload ' . $absolute_path);
+            return;
+        }
+
+        $response = wp_remote_request(
+            $endpoint,
             [
                 'method' => 'PUT',
-                'headers' => [
-                    'Authorization' => $authorization,
-                    'Content-Type' => $mime_type,
-                    'Host' => $host,
-                    'x-amz-content-sha256' => $payload_hash,
-                    'x-amz-date' => $timestamp,
-                ],
-                'body' => file_get_contents($absolute_path),
+                'headers' => $headers,
+                'body' => $body,
                 'timeout' => 30,
             ]
         );
+
+        if (is_wp_error($response)) {
+            error_log('Cloudflare R2 Uploads: HTTP upload failed - ' . $response->get_error_message());
+            return;
+        }
+
+        $status_code = (int) wp_remote_retrieve_response_code($response);
+        if ($status_code < 200 || $status_code >= 300) {
+            error_log('Cloudflare R2 Uploads: HTTP upload failed with status ' . $status_code . ' for ' . $absolute_path);
+        }
+    }
+
+
+    /**
+     * @param array<string, string> $headers
+     */
+    private function put_object_with_curl(string $endpoint, array $headers, string $absolute_path): bool
+    {
+        if (! function_exists('curl_init')) {
+            return false;
+        }
+
+        $file_size = filesize($absolute_path);
+        if (! is_int($file_size) || $file_size < 0) {
+            return false;
+        }
+
+        $file_handle = fopen($absolute_path, 'rb');
+        if ($file_handle === false) {
+            error_log('Cloudflare R2 Uploads: could not open file for upload ' . $absolute_path);
+            return false;
+        }
+
+        $header_lines = [];
+        foreach ($headers as $header_name => $header_value) {
+            $header_lines[] = $header_name . ': ' . $header_value;
+        }
+
+        $ch = curl_init($endpoint);
+        if ($ch === false) {
+            fclose($file_handle);
+            return false;
+        }
+
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
+        curl_setopt($ch, CURLOPT_UPLOAD, true);
+        curl_setopt($ch, CURLOPT_INFILE, $file_handle);
+        curl_setopt($ch, CURLOPT_INFILESIZE, $file_size);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $header_lines);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+
+        curl_exec($ch);
+        $curl_error = curl_error($ch);
+        $status_code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+
+        curl_close($ch);
+        fclose($file_handle);
+
+        if ($curl_error !== '') {
+            error_log('Cloudflare R2 Uploads: cURL upload failed - ' . $curl_error);
+            return false;
+        }
+
+        if ($status_code < 200 || $status_code >= 300) {
+            error_log('Cloudflare R2 Uploads: cURL upload failed with status ' . $status_code . ' for ' . $absolute_path);
+            return false;
+        }
+
+        return true;
     }
 
     private function get_signature_key(string $key, string $date_stamp, string $region_name, string $service_name): string
